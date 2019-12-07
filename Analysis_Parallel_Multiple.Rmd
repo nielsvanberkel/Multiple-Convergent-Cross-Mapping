@@ -1,0 +1,450 @@
+---
+title: "Analysing dataset as a Complex System"
+author: "Niels van Berkel and Vassilis Kostakos"
+date: '6 December 2019'
+output:
+  html_document:
+    code_folding: hide
+    fig_caption: yes
+    fig_height: 3
+    fig_width: 5
+    highlight: tango
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+  word_document:
+    toc: yes
+---
+
+---
+
+```{r setup, warning = FALSE, message=FALSE}
+library(rEDM)
+library(dplyr)
+library(zoo)
+library(ggplot2)
+library(reshape2)
+library(doParallel)
+library(foreach)
+```
+
+# Correlation vs Causality analysis
+
+Tutorial from the [rEMD package](https://cran.r-project.org/web/packages/rEDM/vignettes/rEDM-tutorial.html).
+
+We need a dataset with at least these columns:
+
+* device_id (must be integer, from 1 and upwards)
+* date
+* hour
+* columns with performance variable, eg. battery, notifications, usage, etc.
+
+We are going to use the 2 columns: Number of Apps, and Number of Notifications (which drives which?)
+
+***
+
+## Step 1: Find the optimum E: Embedding dimensions
+The first step is to perform a simple analysis to see which is the optimum value of E (Embedding dimension) for our data (delta 
+values).
+
+```{r}
+embedding_dimension <- function(participant_id, ts, maxE) {
+    # browser()
+    cutoff <- floor(nrow(ts) * 0.7)
+    lib <- c(1, cutoff)
+    pred <- c(cutoff + 1, nrow(ts))
+    simplex_output1 <- simplex(ts[, 1], lib, pred, E = 1:maxE)
+    simplex_output2 <- simplex(ts[, 2], lib, pred, E = 1:maxE)
+    par(mar = c(4, 4, 1, 1), mgp = c(2.5, 1, 0))  # set up margins for plotting
+    
+    simplex_output1[, 6:6][is.na(simplex_output1[, 6:6])] = 0
+    simplex_output2[, 6:6][is.na(simplex_output2[, 6:6])] = 0
+    
+    if (!is.na(sum(simplex_output1$rho)) & !is.na(sum(simplex_output2$rho))) {
+        plot(simplex_output1$E, simplex_output1$rho, type = "l", xlab = "Embedding Dimension (E)", 
+            ylab = "Forecast Skill (rho)", main = paste("P", participant_id, 
+                "-", colnames(ts)[1], sep = " "))
+        plot(simplex_output2$E, simplex_output2$rho, type = "l", xlab = "Embedding Dimension (E)", 
+            ylab = "Forecast Skill (rho)", main = paste("P", participant_id, 
+                "-", colnames(ts)[2], sep = " "))
+        return(c(which.max(simplex_output1$rho), which.max(simplex_output2$rho)))
+    } else return(NA)
+}
+```
+
+***
+
+## Step 2: Test for nonlinearity
+This step ensures that the data is nonlinear rather than auto-correlated. If in the produced graphs, the forecast ability is  greatest when theta == 0, then this means the data is autocorrelated. If the prediction is greatest when theta > 0, then the data is non-linear. We should discard participants whose data is auto-correlated.
+
+```{r cache=TRUE}
+test_for_nonlinearity <- function(participant_id, ts, theE) {
+    # browser()
+    
+    cutoff <- floor(nrow(ts) * 0.7)
+    lib <- c(1, cutoff)
+    pred <- c(cutoff + 1, nrow(ts))
+    smap_output1 <- s_map(ts[, 1], lib, pred, E = theE[1])
+    smap_output2 <- s_map(ts[, 2], lib, pred, E = theE[2])
+    par(mar = c(4, 4, 1, 1), mgp = c(2.5, 1, 0))
+    
+    tryCatch({
+        plot(smap_output1$theta, smap_output1$rho, type = "l", xlab = "Nonlinearity (theta)", 
+            ylab = "Forecast Skill (rho)", main = paste("P", participant_id, 
+                "-", colnames(ts)[1], sep = " "))
+        plot(smap_output2$theta, smap_output2$rho, type = "l", xlab = "Nonlinearity (theta)", 
+            ylab = "Forecast Skill (rho)", main = paste("P", participant_id, 
+                "-", colnames(ts)[2], sep = " "))
+    }, error = function(e) NA)
+    
+    # we return the value of theta for which rho is maximised
+    return(c(smap_output1$theta[which.max(smap_output1$rho)], smap_output2$theta[which.max(smap_output2$rho)]))
+}
+```
+
+***
+
+## Step 3: Convergent Cross Mapping (CCM)
+
+In the previous step we find the optimum E. Next, we perform the CCM analysis using that E. 
+
+```{r cache=TRUE}
+run_ccm <- function(participant_id, ts, theE, var1, var2) {
+    #print(participant_id)
+    #browser()
+    
+    # Define the sequence of window sizes that we consider
+    # sizes <- seq(floor(nrow(ts) * 0.1), nrow(ts), by = floor(nrow(ts)/10))
+    # sizes <- seq(10, 100, by = 10)
+    # Consider 8-hour windows as library sizes
+    sizes <- seq(1, 4*18, by = 1)
+    
+    v1_xmap_v2 <- ccm(ts, E = theE[1], lib_column = var1, target_column = var2, 
+        lib_sizes = sizes, num_samples = 100, random_libs = TRUE, replace = TRUE, 
+        silent = TRUE)
+    v2_xmap_v1 <- ccm(ts, E = theE[2], lib_column = var2, target_column = var1, 
+        lib_sizes = sizes, num_samples = 100, random_libs = TRUE, replace = TRUE, 
+        silent = TRUE)
+    
+    v1_xmap_v2_means <- ccm_means(v1_xmap_v2)
+    v2_xmap_v1_means <- ccm_means(v2_xmap_v1)
+    
+    par(mar = c(4, 4, 1, 1), mgp = c(2.5, 1, 0))  # set up margins for plotting
+    y1 <- v1_xmap_v2_means$rho
+    y2 <- v2_xmap_v1_means$rho
+    
+    # Ocassionally the y values are NaN or NA (result of missing data?)
+    # Replace those with 0 (happens rarely, but crashes the code)
+    y1[is.nan(y1)] = 0
+    y2[is.nan(y2)] = 0
+    y1[is.na(y1)] = 0
+    y2[is.na(y2)] = 0
+    
+    # Calculation of the Asymptotes
+    temp <- sortedXyData(v1_xmap_v2_means$lib_size, y1, tempdf)
+    asymp1 <- stats::NLSstRtAsymptote(temp)
+    temp <- sortedXyData(v2_xmap_v1_means$lib_size, y2, tempdf)
+    asymp2 <- stats::NLSstRtAsymptote(temp)
+    temp <- NULL
+    df <- NULL
+    
+    plot(v1_xmap_v2_means$lib_size, y1, type = "l", col = "red", xlab = "Library Size", 
+        ylab = "Cross Map Skill (rho)", ylim = c(0, 1), main = paste("Participant", 
+            participant_id, sep = " "))
+    lines(v2_xmap_v1_means$lib_size, y2, col = "blue")
+    # Add a dotted line to indicate the magnitude of the cross-correlation
+    # between the variables
+    abline(h = abs(cor(ts[1], ts[2])), lty = 2)
+    abline(h = asymp1, lty = 3, col = "red")
+    abline(h = asymp2, lty = 3, col = "blue")
+    legend(x = "topleft", legend = c(paste(var2, "drives", var1, sep = " "), 
+        paste(var1, "drives", var2, sep = " ")), col = c("red", "blue"), 
+        lwd = 1, bty = "n", inset = 0.02, cex = 0.8)
+    
+    # Absolute difference between the two assymptotes
+    asympdifference <- asymp2 - asymp1
+    
+    # Calculate the RoC for each assymptote Calculate Average Rate of
+    # Change for Asymp 1
+    # avgRoC <- round((head(y1,1) - tail(y1, 1)) /
+    # (head(v1_xmap_v2_means$lib_size,1) - tail(v1_xmap_v2_means$lib_size,
+    # 1)) * 100, 8)
+    avgRoC1 <- tail(y1, 1) - head(y1, 1)
+    
+    # Calculate Average Rate of Change for Asymp 2 avgRoC <-
+    # round((head(y2,1) - tail(y2, 1)) / (head(v2_xmap_v1_means$lib_size,1)
+    # - tail(v2_xmap_v1_means$lib_size, 1)) * 100, 8)
+    avgRoC2 <- tail(y2, 1) - head(y2, 1)
+    
+    # Calculate the absolute difference between participant's correlation
+    # and largest asymptote
+    corvalue <- abs(cor(ts[1], ts[2]))
+    asymp <- max(asymp1, asymp2)
+    cordifference <- asymp - corvalue[, 1]
+    
+    values <- list(participant = participant_id, asympdifference = asympdifference, 
+        RoC1 = avgRoC1 * 100, RoC2 = avgRoC2 * 100, asymp = asymp, asymp1 = asymp1, 
+        asymp2 = asymp2, cordifference = cordifference, cor = corvalue[, 
+            1])
+    return(values)
+}
+```
+
+***
+
+## Do the analysis
+We must extract complete time series per participant. For each participant we run through every step of the analysis. Here is how 
+to interpret the results:
+
+Step 1:
+The optimum E must be a global maximum. If the values are always increasing, we need to search for larger E values.
+
+Step 2:
+We should discard participants whose data is auto-correlated (not engough data perhaps?)
+
+Step 3:
+In the CCM results, we look for 
+* a clear and positive convergene of the CCM values, 
+* check to make sure the CCM convergence value it is above the correlation (black dashed line)
+* identify which of the blue/red lines is above the other. Then that relationship is the strongest one.
+
+Step 4:
+Visualise the results for all participants
+
+```{r fig.height=2, fig.width=6, message=TRUE, warning=FALSE, cache=TRUE}
+# d: the dataframe. Must have the following columns: device_id (must be
+# integer, from 1 and upwards); date; hour;
+
+# howmany: how many participants to do. Enter 0 to do all
+
+# var1, var2: the column names of the df that we want to analyse
+
+# lagdata: calculate the difference between data rows or keep the raw values?
+
+do_the_analysis_parallel <- function(d, howmany, var1, var2, fillgaps = TRUE, lagdata = TRUE) {
+    # browser()
+    
+    participants <- d %>% distinct(device_id)
+    if (howmany <= 0) {
+        num_of_participants <- participants %>% count() %>% as.numeric
+    } else {
+        num_of_participants <- howmany
+    }
+    
+    valuesList <- list()
+    # Parallelise the analysis for each participant
+    cores = detectCores()
+    cl <- makeCluster(cores[1] - 1, outfile = "errors.txt") # Not to overload your computer.
+    registerDoParallel(cl)
+    seed <- sample(1000:9999, 1)  # Use this when saving files in each thread.
+    
+    # When parallelising, we need to inject into each worker thread the
+    # packages and variables that it needs.
+    output <- foreach(i = 1:num_of_participants, .combine = rbind, .packages = c("dplyr", 
+        "rEDM", "zoo", "reshape2"), .export = c("embedding_dimension", 
+        "test_for_nonlinearity", "run_ccm", "valuesList", "seed")) %do% #TODO
+        {
+            #browser()
+          
+            id <- participants$device_id[i]
+            skip_this_participant <- FALSE
+            
+            # Because there may be missing observations, make sure we add those
+            # rows and set them to NA. This will make the time series complete (e.g.
+            # 24 hourly entries per day)
+            
+            participant_data <- d %>% filter(device_id == id)
+            
+            
+            if (fillgaps) {
+                hours <- data.frame(hour = 0:23)
+                tmp <- participant_data %>% distinct(date)
+                all_combinations <- expand.grid(hour = 0:23, date = tmp$date)
+                r <- full_join(all_combinations, participant_data, by = c("date", 
+                  "hour"))
+                participant_data <- r
+            }
+            participant_data <- participant_data %>% select(!!rlang::sym(var1), 
+                !!rlang::sym(var2))
+            
+            # Calculate lag data instead of keeping the raw data
+            if (lagdata) {
+                names <- colnames(participant_data)
+                participant_data <- data.frame(diff(participant_data[,1]), diff(participant_data[,2]))
+                colnames(participant_data) <- names 
+            }
+            
+            # Convert NAs to 0
+            participant_data[1][is.na(participant_data[1])] <- 0
+            participant_data[2][is.na(participant_data[2])] <- 0
+            
+            # Ignore participants with empty data or little data
+            if (nrow(participant_data) < 10) {
+                message(paste("Skipping participant", id, "due to limited data."))
+                skip_this_participant <- TRUE
+                ## Uncomment the line below to speed up analysis. We can give up on
+                ## participants early.
+                return()
+            }
+            
+            # Configure plots in a row for each thread
+            pdf(sprintf("images/%04d_participant_%03d.pdf", seed, id), 
+                width = 10, height = 2)
+            par(mfrow = c(1, 5))  # widths=c(2,2,2), heights=c(1,1,1))
+            
+            # Step 1
+            theE <- embedding_dimension(id, participant_data, maxE = 15)
+            if (is.na(theE)) {
+                # message(paste('Skipping participant',i,'due to invalid E'))
+                # skip_this_participant <- FALSE
+                theE <- c(1, 1)
+                # dev.off() return()
+            }
+            
+            # Step 2
+            theta <- test_for_nonlinearity(id, participant_data, theE)
+            if (length(theta) == 0) 
+                theta <- c(0, 0)
+            # if((theta < 0.8) | (theta > 6)) { 
+            # message(paste('Skipping participant',i, 'due to data not being non-linear'))
+            # skip_this_participant <- TRUE dev.off() return() }
+            
+            # Step 3
+            values <- run_ccm(id, participant_data, theE, var1, var2)
+            tmp <- which.max(c(values$asymp1, values$asymp2))
+            
+            if (c(values$RoC1, values$RoC2)[tmp] < 0) {
+                message(paste("Skipping participant", id, "strongest CCM line is not converging."))
+                skip_this_participant <- FALSE
+            }
+            
+            # store all the values used for final plot
+            values$ignore <- skip_this_participant
+            
+            # close the plot device for the thread
+            dev.off()
+            return(values)
+        }
+    
+    # Stop the parallelisation
+    stopCluster(cl)
+    
+    # browser()
+    
+    # Return as dataframe with numeric values
+    output_formated <- NULL
+    if (!is.null(output)) {
+        if (nrow(output) > 2) {
+            output_formated <- data.frame(matrix(unlist(output), nrow = nrow(output)))
+            colnames(output_formated) <- colnames(output)
+        }
+    }
+    
+    return(output_formated)
+}
+```
+
+***
+
+## Step 4: Summarise all participants
+
+Now that we have created individual plots per participant, we want to construct a single image displaying what is going on in all 
+the data for all participants.
+
+```{r  fig.width=16, fig.height=9}
+plot_summary <- function(results, var1, var2) {
+    knitr::opts_chunk$set(fig.path = "images/")
+    
+    # The parallelised functions return the data in a slightly different
+    # format, so we need to do some processing to get the results into the
+    # required format.
+    if (!is.data.frame(results)) {
+        # Convert list of values / participant to a dataframe
+        df <- do.call(rbind, lapply(valuesList, data.frame, stringsAsFactors = FALSE))
+        df <- df[complete.cases(df$RoC1), ]
+        df <- df[complete.cases(df$RoC2), ]
+    } else {
+        df <- results
+        df$ignore <- as.logical(df$ignore)
+    }
+    
+    df$ignore[df$cordifference < 0] <- TRUE
+    
+    # Calculate the mean asymptote difference for participants that we
+    # retain (discard the ones we ignore).
+    # Exclude infinite values in mean calculation.
+    #browser()
+    the_mean <- mean(df$asympdifference[df$ignore == 0])  
+    the_mean <- round(the_mean, digits = 3)
+    # Exclude infinite values in SD calculation.
+    the_sd <- sd(df$asympdifference[df$ignore == 0])  
+    the_sd <- round(the_sd, digits = 3)
+    
+    # Define plot margin based on plot values.
+    plot_mar <- round(max(max(abs(df$asympdifference), na.rm = TRUE), max(abs(df$cordifference), 
+        na.rm = TRUE)), 1) + 0.1
+    
+    df$ignore <- as.factor(df$ignore)
+    levels(df$ignore)[levels(df$ignore) == "TRUE"] <- "Invalid"
+    levels(df$ignore)[levels(df$ignore) == "FALSE"] <- "Valid"
+    
+    plot(ggplot(df, aes(x = df$asympdifference, y = df$cordifference)) + 
+        geom_hline(yintercept = 0, linetype = "dashed") + geom_vline(xintercept = 0, 
+        linetype = "dashed") + geom_point(aes(colour = ignore), size = 1.8) + 
+        scale_color_manual(values = c(Invalid = "#BD5200", Valid = "#008698")) + 
+        ylab("Difference to correlation\n(significance)") + xlab(paste("Difference between asymptotes (effect size)\n", 
+        var2, "is stronger", sprintf("↔"), var1, "is stronger\n", "Mean:", 
+        the_mean, "SD:", the_sd)) + theme_minimal() + theme(axis.title = element_text(size = 9), 
+        panel.grid.minor = element_blank(), legend.title = element_blank()) + 
+        geom_vline(xintercept = c(the_mean), linetype = "dotted") + xlim(-0.9, 
+        0.9) + ylim(-0.9, 0.9))
+    
+    df.plot <- melt(df[, c("asymp1", "asymp2", "cor")], id.vars = NULL)
+    df.plot$variable <- as.factor(df.plot$variable)
+    
+    levels(df.plot$variable)[levels(df.plot$variable) == "asymp1"] <- paste(var2, 
+        "drives", var1, sep = " ")
+    levels(df.plot$variable)[levels(df.plot$variable) == "asymp2"] <- paste(var1, 
+        "drives", var2, sep = " ")
+    levels(df.plot$variable)[levels(df.plot$variable) == "cor"] <- "Correlation"
+    
+    ggplot(df.plot, aes(x = value, colour = variable, fill = variable)) + 
+        geom_density(alpha = 0.25) + theme_minimal() + theme(axis.title = element_text(size = 7), 
+        panel.grid.minor = element_blank())
+}
+```
+
+
+
+# Investigate causality between variables
+We try to investigate how the various variables affect each other. This is an assesment of causality rather than correlation.
+
+```{r Analyse behaviour, echo=FALSE, fig.height=4, fig.width=6, warning=FALSE, cache=TRUE}
+d <- read.csv("example_data.csv", header = T)
+
+#unlink('Analysis_Parallel_Multiple_V3_cache', recursive = TRUE)
+
+# NOTE: Before calling the next piece of code, need to make sure that
+# the dataframe has these variables: * device_id (must be integer, from
+# 1 and upwards) * date (can be string or date) * hour (can be string
+# or int) * columns with performance variable, eg. battery,
+# notifications, usage, etc. Must be numeric.  When we call the
+# function, we indicate which variables we want to compare.
+
+str(d)
+
+# Create a vector of variable-pairs to go through
+#vector <- c("hour", "battery_level", "notifications", "session_count")
+vector <- c("hour", "battery_level")
+# The above will run hour <-> battery_level and notifications <-> session_count
+
+for (i in seq(from = 1, to = length(vector), by = 2)) {
+    results <- do_the_analysis_parallel(d, 5, vector[i], vector[i + 1], 
+        fillgaps = T)
+    #print(results)
+    print(plot_summary(results, vector[i], vector[i + 1]))
+}
+```
+
+
+
