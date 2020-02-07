@@ -19,6 +19,16 @@ output:
 ---
 
 ```{r setup, warning = FALSE, message=FALSE}
+# rEDM package on CRAN "Archived on 2020-01-16 as check issues were not corrected in time."
+# Temporary workaround:
+install.packages("devtools")
+library(devtools)
+# Requires R compiler tools. 
+# Linux: https://thecoatlessprofessor.com/programming/cpp/installing-rtools-for-compiled-code-via-rcpp/
+# Mac OS: https://thecoatlessprofessor.com/programming/cpp/r-compiler-tools-for-rcpp-on-macos/ / https://github.com/rmacoslib/r-macos-rtools/releases. 
+# Windows: https://thecoatlessprofessor.com/programming/cpp/installing-rtools-for-compiled-code-via-rcpp/
+
+install_url('https://cran.r-project.org/src/contrib/Archive/rEDM/rEDM_0.7.3.tar.gz')
 library(rEDM)
 library(dplyr)
 library(zoo)
